@@ -64,6 +64,18 @@ Public Class Form1
         Try
             DataText.MaxLength = 32767
 
+            ' Identify the exact executable instance, including older builds.
+            Dim appVersion As String = Me.GetType().Assembly.GetName().Version.ToString()
+            Dim buildId As String =
+                Me.GetType().Assembly.ManifestModule.ModuleVersionId.ToString("N")
+
+            Me.Text = "FirstStepApp v" + appVersion +
+                      " | build " + buildId.Substring(0, 8).ToUpperInvariant()
+
+            LogStatus("APP START | version=" + appVersion +
+                      " | buildId=" + buildId +
+                      " | exe=" + Application.ExecutablePath)
+
             Timer1.Stop()
             Timer1.Interval = MainTimerIntervalMs
 
