@@ -41,6 +41,7 @@ Public Class Form1
     Private Const ReconnectDelayMs As Integer = 1000
     Private Const LongReconnectDelayMs As Integer = 5000
     Private Const MaxLonResyncAttempts As Integer = 2
+    Private Const WorkerStallWarningMs As Integer = 15000
 
     Private CurrentState As CameraState = CameraState.Disconnected
     Private NextActionAt As DateTime = DateTime.MinValue
@@ -50,6 +51,8 @@ Public Class Form1
     Private RecoveryAttempt As Integer = 0
     Private LonResyncAttempt As Integer = 0
     Private PendingReadData As String = String.Empty
+    Private WorkerRequestAt As DateTime = DateTime.MinValue
+    Private WorkerStallReported As Boolean = False
 
     ' Each TCP connection gets a new generation number. Data from an old
     ' connection is ignored after reconnecting.
@@ -81,6 +84,7 @@ Public Class Form1
             AddHandler m_worker.OperationCompleted, AddressOf WorkerOperationCompleted
             AddHandler m_worker.TextReceived, AddressOf ReceivedDataWrite
             AddHandler m_worker.DiagnosticCompleted, AddressOf WorkerDiagnosticCompleted
+            AddHandler m_worker.WorkerFault, AddressOf WorkerFaultReported
 
             ' Identify the exact executable instance, including older builds.
             Dim appVersion As String = Me.GetType().Assembly.GetName().Version.ToString()
@@ -263,6 +267,8 @@ Public Class Form1
         ReaderConnected = False
         LonResyncAttempt = 0
         PendingReadData = String.Empty
+        WorkerRequestAt = DateTime.Now
+        WorkerStallReported = False
 
         InvalidateReaderGeneration()
 
@@ -343,7 +349,19 @@ Public Class Form1
         e As EventArgs
     ) Handles Timer1.Tick
 
-        If ClosingApplication OrElse CommandInProgress Then Return
+        If ClosingApplication Then Return
+
+        If CurrentState = CameraState.Connecting OrElse CommandInProgress Then
+            If Not WorkerStallReported AndAlso
+               WorkerRequestAt <> DateTime.MinValue AndAlso
+               (DateTime.Now - WorkerRequestAt).TotalMilliseconds >= WorkerStallWarningMs Then
+
+                WorkerStallReported = True
+                LogStatus("WARNING: Keyence SDK worker has not completed the current " +
+                          "operation in 15 seconds; no overlapping command will be sent.")
+            End If
+            Return
+        End If
 
         Try
             Select Case CurrentState
@@ -384,6 +402,9 @@ Public Class Form1
         If ClosingApplication OrElse result.Generation <> ReaderGeneration Then Return
 
         If result.Kind = KeyenceWorker.OperationKind.Connect Then
+            WorkerRequestAt = DateTime.MinValue
+            WorkerStallReported = False
+
             If result.Failure IsNot Nothing Then
                 StartRecovery("Connect failed: " + result.Failure.Message)
                 Return
@@ -407,6 +428,9 @@ Public Class Form1
         If result.Kind <> KeyenceWorker.OperationKind.Command Then Return
 
         CommandInProgress = False
+        WorkerRequestAt = DateTime.MinValue
+        WorkerStallReported = False
+
         Dim outcome As CommandOutcome = CommandOutcome.ExceptionThrown
 
         If result.Failure Is Nothing Then
@@ -516,6 +540,18 @@ Public Class Form1
 
     End Sub
 
+    Private Sub WorkerFaultReported(message As String)
+
+        If ClosingApplication Then Return
+
+        ReaderConnected = False
+        CommandInProgress = False
+        CurrentState = CameraState.Disconnected
+        TgrBtn.Enabled = False
+        LogStatus("FATAL: Keyence SDK worker stopped. Restart application. " + message)
+
+    End Sub
+
     Private Sub WorkerDiagnosticCompleted(generation As Integer, lines As String())
 
         If ClosingApplication OrElse generation <> ReaderGeneration Then Return
@@ -550,6 +586,8 @@ Public Class Form1
         If Not m_worker.TryCommand(command, purpose, ReaderGeneration) Then Return False
 
         CommandInProgress = True
+        WorkerRequestAt = DateTime.Now
+        WorkerStallReported = False
         Return True
 
     End Function
@@ -640,6 +678,8 @@ Public Class Form1
         CommandInProgress = False
         LonResyncAttempt = 0
         PendingReadData = String.Empty
+        WorkerRequestAt = DateTime.MinValue
+        WorkerStallReported = False
 
         InvalidateReaderGeneration()
 
@@ -671,6 +711,8 @@ Public Class Form1
         CurrentState = CameraState.Connecting
         CommandInProgress = False
         ReaderConnected = False
+        WorkerRequestAt = DateTime.Now
+        WorkerStallReported = False
         InvalidateReaderGeneration()
 
         If m_worker Is Nothing OrElse
