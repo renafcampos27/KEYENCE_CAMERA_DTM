@@ -8,7 +8,9 @@ Public Class Form1
         Disconnected
         Connecting
         SynchronizingOff
+        TurningOff
         WaitingOffDelay
+        TurningOn
         WaitingForRead
         ProcessingRead
         Recovering
@@ -23,7 +25,7 @@ Public Class Form1
         ExceptionThrown
     End Enum
 
-    Private m_reader As ReaderAccessor = New ReaderAccessor()
+    Private m_worker As KeyenceWorker
     Private m_searcher As ReaderSearcher = New ReaderSearcher()
     Private m_nicList As List(Of NicSearchResult) = New List(Of NicSearchResult)()
 
@@ -39,6 +41,7 @@ Public Class Form1
     Private Const ReconnectDelayMs As Integer = 1000
     Private Const LongReconnectDelayMs As Integer = 5000
     Private Const MaxLonResyncAttempts As Integer = 2
+    Private Const WorkerStallWarningMs As Integer = 15000
 
     Private CurrentState As CameraState = CameraState.Disconnected
     Private NextActionAt As DateTime = DateTime.MinValue
@@ -47,6 +50,9 @@ Public Class Form1
     Private ClosingApplication As Boolean = False
     Private RecoveryAttempt As Integer = 0
     Private LonResyncAttempt As Integer = 0
+    Private PendingReadData As String = String.Empty
+    Private WorkerRequestAt As DateTime = DateTime.MinValue
+    Private WorkerStallReported As Boolean = False
 
     ' Each TCP connection gets a new generation number. Data from an old
     ' connection is ignored after reconnecting.
@@ -55,8 +61,6 @@ Public Class Form1
     Private ReadOnly LogFilePath As String =
         Path.Combine(Application.StartupPath, "KeyenceTrigger.log")
 
-    Private Delegate Sub ReaderDataDelegate(value As String, generation As Integer)
-
     Private Sub Form1_Load(
         sender As Object,
         e As EventArgs
@@ -64,6 +68,23 @@ Public Class Form1
 
         Try
             DataText.MaxLength = 32767
+
+            m_worker = New KeyenceWorker(
+                Sub(action As Action)
+                    If ClosingApplication OrElse Me.IsDisposed OrElse
+                       Not Me.IsHandleCreated Then Return
+
+                    Try
+                        Me.BeginInvoke(action)
+                    Catch ex As InvalidOperationException
+                        ' Form is closing.
+                    End Try
+                End Sub
+            )
+            AddHandler m_worker.OperationCompleted, AddressOf WorkerOperationCompleted
+            AddHandler m_worker.TextReceived, AddressOf ReceivedDataWrite
+            AddHandler m_worker.DiagnosticCompleted, AddressOf WorkerDiagnosticCompleted
+            AddHandler m_worker.WorkerFault, AddressOf WorkerFaultReported
 
             ' Identify the exact executable instance, including older builds.
             Dim appVersion As String = Me.GetType().Assembly.GetName().Version.ToString()
@@ -225,7 +246,7 @@ Public Class Form1
             NextActionAt = DateTime.MinValue
 
             InvalidateReaderGeneration()
-            SafeDisconnectAndDisposeReader()
+            If m_worker IsNot Nothing Then m_worker.TryDisconnect(ReaderGeneration)
 
             NICcomboBox.Enabled = True
             SchBtn.Enabled = True
@@ -243,70 +264,24 @@ Public Class Form1
 
         CurrentState = CameraState.Connecting
         CommandInProgress = False
+        ReaderConnected = False
         LonResyncAttempt = 0
+        PendingReadData = String.Empty
+        WorkerRequestAt = DateTime.Now
+        WorkerStallReported = False
 
-        Try
-            InvalidateReaderGeneration()
-            SafeDisconnectAndDisposeReader()
+        InvalidateReaderGeneration()
 
-            m_reader = New ReaderAccessor()
-            m_reader.IpAddress = ipAddress.Trim()
-
-            ReaderGeneration += 1
-            Dim thisGeneration As Integer = ReaderGeneration
-
-            ' Keep the production connection simple. LiveView is not started.
-            m_reader.Connect(
-                Sub(data As Byte()) ReceivedDataAction(data, thisGeneration)
-            )
-
-            ReaderConnected = True
-            RecoveryAttempt = 0
-
-            NICcomboBox.Enabled = False
-            SchBtn.Enabled = False
-            comboBox1.Enabled = False
-            SctBtn.Enabled = True
-            TgrBtn.Enabled = True
-
-            ' IMPORTANT:
-            ' LOFF is used only to create a known OFF edge before LON.
-            ' An ER response to LOFF is NOT fatal because Keyence documents
-            ' that LOFF can return failure when the reader is already in
-            ' reading standby (already OFF).
-            CurrentState = CameraState.SynchronizingOff
-            NextActionAt = DateTime.Now.AddMilliseconds(InitialCommandDelayMs)
-
-            LogStatus("Reader connected. Trigger synchronization scheduled.")
-
-        Catch ex As Exception
-            ReaderConnected = False
-            LogStatus("Reader connection error: " + ex.Message)
-            StartRecovery("Connection failed")
-        End Try
+        If m_worker Is Nothing OrElse
+           Not m_worker.TryConnect(ipAddress.Trim(), ReaderGeneration) Then
+            StartRecovery("Reader connection could not be queued")
+        Else
+            LogStatus("Connecting reader on worker: " + ipAddress.Trim())
+        End If
 
     End Sub
 
-    Private Sub ReceivedDataAction(data As Byte(), generation As Integer)
 
-        If ClosingApplication Then Return
-        If generation <> ReaderGeneration Then Return
-        If data Is Nothing OrElse data.Length = 0 Then Return
-        If Not IsHandleCreated OrElse IsDisposed Then Return
-
-        Dim receivedText As String = Encoding.ASCII.GetString(data)
-
-        Try
-            BeginInvoke(
-                New ReaderDataDelegate(AddressOf ReceivedDataWrite),
-                receivedText,
-                generation
-            )
-        Catch
-            ' The form can be closing while data is arriving.
-        End Try
-
-    End Sub
 
     Private Sub ReceivedDataWrite(receivedData As String, generation As Integer)
 
@@ -321,61 +296,24 @@ Public Class Form1
 
         Dim upperData As String = cleanData.ToUpperInvariant()
 
-        ' Command responses belong to ExecCommand. If the SDK also forwards
-        ' them through the data callback, they must never be handled as labels.
         If IsCommandResponse(upperData) OrElse IsDiagnosticResponse(upperData) Then
             LogStatus("Command/diagnostic response on data channel: " + cleanData)
             Return
         End If
 
         If CurrentState <> CameraState.WaitingForRead Then
-            LogStatus(
-                "Reader data ignored while state is " +
-                CurrentState.ToString() + ": " + cleanData
-            )
+            LogStatus("Reader data ignored while state is " +
+                      CurrentState.ToString() + ": " + cleanData)
             Return
         End If
 
         CurrentState = CameraState.ProcessingRead
         NextActionAt = DateTime.MinValue
+        PendingReadData = cleanData
 
-        ' Close the trigger before touching the browser. This prevents browser
-        ' activity from overlapping with LON/LOFF commands.
-        Dim loffOutcome As CommandOutcome =
-            ExecuteTriggerCommand("LOFF", "Close cycle after reader response")
-
-        Try
-            If IsValidDtm(cleanData) Then
-                LogStatus("Valid DTM received: " + cleanData)
-                EnviarComoTeclado(cleanData)
-
-            ElseIf upperData = "ERROR" OrElse
-                   upperData = "4552524F52" Then
-
-                LogStatus("Reader returned ERROR.")
-
-            Else
-                LogStatus("Invalid reader data ignored: " + cleanData)
-            End If
-
-        Catch ex As Exception
-            LogStatus("Web transfer error: " + ex.Message)
-        End Try
-
-        If loffOutcome = CommandOutcome.ExceptionThrown OrElse
-           loffOutcome = CommandOutcome.UnexpectedResponse Then
-
-            StartRecovery("LOFF exception or unexpected response after reading")
-        Else
-            ' LOFF can return ER if the reader has already finished the read.
-            ' A missing response is not confirmation of the physical OFF state.
-            If loffOutcome = CommandOutcome.ExplicitFailure OrElse
-               loffOutcome = CommandOutcome.NoResponse Then
-
-                LogStatus("LOFF OFF state not independently confirmed; continuing normal cycle.")
-            End If
-
-            ScheduleTriggerOnAfterOffDelay()
+        ' LOFF is completed on the worker BEFORE any browser SendKeys.
+        If Not QueueTriggerCommand("LOFF", "AfterRead") Then
+            StartRecovery("Unable to queue LOFF after reader response")
         End If
 
     End Sub
@@ -389,6 +327,11 @@ Public Class Form1
 
         If Not ReaderConnected Then
             StartRecovery("Manual reconnect request")
+            Return
+        End If
+
+        If CommandInProgress Then
+            LogStatus("Manual trigger request ignored: command already pending.")
             Return
         End If
 
@@ -407,94 +350,215 @@ Public Class Form1
     ) Handles Timer1.Tick
 
         If ClosingApplication Then Return
-        If CommandInProgress Then Return
+
+        If CurrentState = CameraState.Connecting OrElse CommandInProgress Then
+            If Not WorkerStallReported AndAlso
+               WorkerRequestAt <> DateTime.MinValue AndAlso
+               (DateTime.Now - WorkerRequestAt).TotalMilliseconds >= WorkerStallWarningMs Then
+
+                WorkerStallReported = True
+                LogStatus("WARNING: Keyence SDK worker has not completed the current " +
+                          "operation in 15 seconds; no overlapping command will be sent.")
+            End If
+            Return
+        End If
 
         Try
             Select Case CurrentState
-
                 Case CameraState.SynchronizingOff
                     If Not IsActionDue() Then Return
 
-                    Dim loffOutcome As CommandOutcome =
-                        ExecuteTriggerCommand("LOFF", "Synchronize trigger OFF")
-
-                    If loffOutcome = CommandOutcome.ExceptionThrown OrElse
-                       loffOutcome = CommandOutcome.UnexpectedResponse Then
-
-                        StartRecovery("LOFF exception or unexpected response during synchronization")
+                    If QueueTriggerCommand("LOFF", "SyncOff") Then
+                        CurrentState = CameraState.TurningOff
                     Else
-                        ' ER can mean the reader was already OFF. Do not retry
-                        ' LOFF indefinitely on ER or an absent response.
-                        If loffOutcome = CommandOutcome.ExplicitFailure OrElse
-                           loffOutcome = CommandOutcome.NoResponse Then
-
-                            LogStatus("LOFF OFF state not independently confirmed.")
-                        End If
-
-                        ScheduleTriggerOnAfterOffDelay()
+                        StartRecovery("Unable to queue synchronization LOFF")
                     End If
 
                 Case CameraState.WaitingOffDelay
                     If Not IsActionDue() Then Return
 
-                    Dim lonOutcome As CommandOutcome =
-                        ExecuteTriggerCommand("LON", "Start read cycle")
-
-                    Select Case lonOutcome
-                        Case CommandOutcome.Success
-                            CurrentState = CameraState.WaitingForRead
-                            NextActionAt = DateTime.MinValue
-                            RecoveryAttempt = 0
-                            LonResyncAttempt = 0
-
-                            LogStatus("LON accepted by reader; waiting for a label.")
-
-                        Case CommandOutcome.NoResponse
-                            ' A trigger response may be disabled in the reader.
-                            ' Query state for diagnosis but NEVER send blind LON
-                            ' retries just because no label has arrived.
-                            LogReaderDiagnostics("LON without response")
-                            CurrentState = CameraState.WaitingForRead
-                            NextActionAt = DateTime.MinValue
-                            RecoveryAttempt = 0
-                            LonResyncAttempt = 0
-
-                            LogStatus("LON sent without acknowledgement; trigger state UNCONFIRMED.")
-
-                        Case CommandOutcome.ExplicitFailure,
-                             CommandOutcome.UnexpectedResponse
-
-                            LogReaderDiagnostics("LON rejected or unexpected response")
-                            LonResyncAttempt += 1
-
-                            If LonResyncAttempt <= MaxLonResyncAttempts Then
-                                CurrentState = CameraState.SynchronizingOff
-                                NextActionAt = DateTime.Now.AddMilliseconds(250)
-
-                                LogStatus(
-                                    "LON not confirmed; resynchronizing OFF before retry " +
-                                    LonResyncAttempt.ToString() + "."
-                                )
-                            Else
-                                StartRecovery("LON not confirmed after resynchronization")
-                            End If
-
-                        Case CommandOutcome.ExceptionThrown
-                            StartRecovery("LON communication exception")
-                    End Select
+                    If QueueTriggerCommand("LON", "StartRead") Then
+                        CurrentState = CameraState.TurningOn
+                    Else
+                        StartRecovery("Unable to queue LON")
+                    End If
 
                 Case CameraState.Recovering
                     If Not IsActionDue() Then Return
                     AttemptReconnect()
 
                 Case Else
-                    ' No periodic LON/LOFF is sent while waiting for a label.
+                    ' No watchdog: a legitimate read can take as long as needed.
             End Select
-
         Catch ex As Exception
             LogStatus("State machine error: " + ex.Message)
             StartRecovery("Unhandled state machine exception")
         End Try
+
+    End Sub
+
+    Private Sub WorkerOperationCompleted(result As KeyenceWorker.OperationResult)
+
+        If ClosingApplication OrElse result.Generation <> ReaderGeneration Then Return
+
+        If result.Kind = KeyenceWorker.OperationKind.Connect Then
+            WorkerRequestAt = DateTime.MinValue
+            WorkerStallReported = False
+
+            If result.Failure IsNot Nothing Then
+                StartRecovery("Connect failed: " + result.Failure.Message)
+                Return
+            End If
+
+            ReaderConnected = True
+            RecoveryAttempt = 0
+
+            NICcomboBox.Enabled = False
+            SchBtn.Enabled = False
+            comboBox1.Enabled = False
+            SctBtn.Enabled = True
+            TgrBtn.Enabled = True
+
+            CurrentState = CameraState.SynchronizingOff
+            NextActionAt = DateTime.Now.AddMilliseconds(InitialCommandDelayMs)
+            LogStatus("Reader connected on worker. Trigger synchronization scheduled.")
+            Return
+        End If
+
+        If result.Kind <> KeyenceWorker.OperationKind.Command Then Return
+
+        CommandInProgress = False
+        WorkerRequestAt = DateTime.MinValue
+        WorkerStallReported = False
+
+        Dim outcome As CommandOutcome = CommandOutcome.ExceptionThrown
+
+        If result.Failure Is Nothing Then
+            outcome = ClassifyCommandResponse(NormalizeReaderData(result.Response))
+            LogStatus(result.Purpose + " " +
+                      If(result.Purpose = "StartRead", "LON", "LOFF") +
+                      " -> " + outcome.ToString() +
+                      FormatCommandResponse(NormalizeReaderData(result.Response)))
+        Else
+            LogStatus(result.Purpose + " SDK exception: " + result.Failure.Message)
+        End If
+
+        Select Case result.Purpose
+            Case "SyncOff"
+                If CurrentState <> CameraState.TurningOff Then Return
+
+                If outcome = CommandOutcome.ExceptionThrown OrElse
+                   outcome = CommandOutcome.UnexpectedResponse Then
+                    StartRecovery("LOFF exception or unexpected response during synchronization")
+                    Return
+                End If
+
+                If outcome = CommandOutcome.NoResponse OrElse
+                   outcome = CommandOutcome.ExplicitFailure Then
+                    LogStatus("LOFF OFF state not independently confirmed.")
+                End If
+
+                ScheduleTriggerOnAfterOffDelay()
+
+            Case "AfterRead"
+                If CurrentState <> CameraState.ProcessingRead Then Return
+
+                CompleteReaderCycle(outcome)
+
+            Case "StartRead"
+                If CurrentState <> CameraState.TurningOn Then Return
+
+                Select Case outcome
+                    Case CommandOutcome.Success
+                        CurrentState = CameraState.WaitingForRead
+                        NextActionAt = DateTime.MinValue
+                        RecoveryAttempt = 0
+                        LonResyncAttempt = 0
+                        LogStatus("LON accepted by reader; waiting for a label.")
+
+                    Case CommandOutcome.NoResponse
+                        LogReaderDiagnostics("LON without response")
+                        CurrentState = CameraState.WaitingForRead
+                        NextActionAt = DateTime.MinValue
+                        RecoveryAttempt = 0
+                        LonResyncAttempt = 0
+                        LogStatus("LON sent without acknowledgement; trigger state UNCONFIRMED.")
+
+                    Case CommandOutcome.ExplicitFailure,
+                         CommandOutcome.UnexpectedResponse
+
+                        LogReaderDiagnostics("LON rejected or unexpected response")
+                        LonResyncAttempt += 1
+
+                        If LonResyncAttempt <= MaxLonResyncAttempts Then
+                            CurrentState = CameraState.SynchronizingOff
+                            NextActionAt = DateTime.Now.AddMilliseconds(250)
+                            LogStatus("LON not confirmed; resynchronizing OFF before retry " +
+                                      LonResyncAttempt.ToString() + ".")
+                        Else
+                            StartRecovery("LON not confirmed after resynchronization")
+                        End If
+
+                    Case CommandOutcome.ExceptionThrown
+                        StartRecovery("LON communication exception")
+                End Select
+        End Select
+
+    End Sub
+
+    Private Sub CompleteReaderCycle(loffOutcome As CommandOutcome)
+
+        Dim cleanData As String = PendingReadData
+        PendingReadData = String.Empty
+        Dim upperData As String = cleanData.ToUpperInvariant()
+
+        Try
+            If IsValidDtm(cleanData) Then
+                LogStatus("Valid DTM received: " + cleanData)
+                EnviarComoTeclado(cleanData)
+            ElseIf upperData = "ERROR" OrElse upperData = "4552524F52" Then
+                LogStatus("Reader returned ERROR.")
+            Else
+                LogStatus("Invalid reader data ignored: " + cleanData)
+            End If
+        Catch ex As Exception
+            LogStatus("Web transfer error: " + ex.Message)
+        End Try
+
+        If loffOutcome = CommandOutcome.ExceptionThrown OrElse
+           loffOutcome = CommandOutcome.UnexpectedResponse Then
+
+            StartRecovery("LOFF exception or unexpected response after reading")
+        Else
+            If loffOutcome = CommandOutcome.NoResponse OrElse
+               loffOutcome = CommandOutcome.ExplicitFailure Then
+                LogStatus("LOFF OFF state not independently confirmed; continuing normal cycle.")
+            End If
+
+            ScheduleTriggerOnAfterOffDelay()
+        End If
+
+    End Sub
+
+    Private Sub WorkerFaultReported(message As String)
+
+        If ClosingApplication Then Return
+
+        ReaderConnected = False
+        CommandInProgress = False
+        CurrentState = CameraState.Disconnected
+        TgrBtn.Enabled = False
+        LogStatus("FATAL: Keyence SDK worker stopped. Restart application. " + message)
+
+    End Sub
+
+    Private Sub WorkerDiagnosticCompleted(generation As Integer, lines As String())
+
+        If ClosingApplication OrElse generation <> ReaderGeneration Then Return
+
+        For Each line As String In lines
+            LogStatus(line)
+        Next
 
     End Sub
 
@@ -514,55 +578,17 @@ Public Class Form1
         Return NextActionAt = DateTime.MinValue OrElse DateTime.Now >= NextActionAt
     End Function
 
-    Private Function ExecuteTriggerCommand(
-        command As String,
-        reason As String
-    ) As CommandOutcome
+    Private Function QueueTriggerCommand(command As String, purpose As String) As Boolean
 
-        If ClosingApplication AndAlso command.ToUpperInvariant() <> "LOFF" Then
-            Return CommandOutcome.ExceptionThrown
-        End If
+        If ClosingApplication OrElse Not ReaderConnected OrElse
+           CommandInProgress OrElse m_worker Is Nothing Then Return False
 
-        If Not ReaderConnected OrElse m_reader Is Nothing Then
-            LogStatus(command + " not sent because reader is not connected.")
-            Return CommandOutcome.ExceptionThrown
-        End If
-
-        If CommandInProgress Then
-            LogStatus(command + " not sent because another command is active.")
-            Return CommandOutcome.ExceptionThrown
-        End If
+        If Not m_worker.TryCommand(command, purpose, ReaderGeneration) Then Return False
 
         CommandInProgress = True
-
-        Try
-            ' Use the same SDK call form that worked in the original Keyence
-            ' sample/application. Do not make trigger operation depend on an
-            ' exact textual response.
-            Dim response As String =
-                NormalizeReaderData(m_reader.ExecCommand(command))
-
-            Dim outcome As CommandOutcome = ClassifyCommandResponse(response)
-
-            LogStatus(
-                command + " -> " + outcome.ToString() +
-                FormatCommandResponse(response) +
-                " | " + reason
-            )
-
-            Return outcome
-
-        Catch ex As Exception
-            LogStatus(
-                command + " exception: " + ex.Message +
-                " | " + reason
-            )
-
-            Return CommandOutcome.ExceptionThrown
-
-        Finally
-            CommandInProgress = False
-        End Try
+        WorkerRequestAt = DateTime.Now
+        WorkerStallReported = False
+        Return True
 
     End Function
 
@@ -623,45 +649,12 @@ Public Class Form1
 
     Private Sub LogReaderDiagnostics(reason As String)
 
-        ' Read-only commands. Never unlock, reset, change banks or update
-        ' trigger state based on BUSYSTAT=none: it may be normal in standby.
         If ClosingApplication OrElse Not ReaderConnected OrElse
-           m_reader Is Nothing OrElse CommandInProgress Then Return
+           m_worker Is Nothing Then Return
 
-        CommandInProgress = True
-
-        Try
-            Dim commands() As String = {"BUSYSTAT", "ERRSTAT", "RLOCK"}
-
-            For Each diagnosticCommand As String In commands
-                Try
-                    Dim result As String =
-                        NormalizeReaderData(m_reader.ExecCommand(diagnosticCommand))
-
-                    If String.IsNullOrWhiteSpace(result) Then
-                        LogStatus("DIAG " + diagnosticCommand +
-                                  " -> no response | " + reason)
-                    Else
-                        LogStatus("DIAG " + diagnosticCommand +
-                                  " -> " + result + " | " + reason)
-
-                        If diagnosticCommand = "RLOCK" AndAlso
-                           result.Equals("OK,RLOCK,LOCK",
-                                         StringComparison.OrdinalIgnoreCase) Then
-
-                            LogStatus("DIAG WARNING: Keyence reports TRIGGER LOCK. " +
-                                      "No automatic UNLOCK was sent.")
-                        End If
-                    End If
-                Catch ex As Exception
-                    ' Diagnostic failure must not interrupt normal reading.
-                    LogStatus("DIAG " + diagnosticCommand +
-                              " failed: " + ex.Message)
-                End Try
-            Next
-        Finally
-            CommandInProgress = False
-        End Try
+        If Not m_worker.TryDiagnostics(reason, ReaderGeneration) Then
+            LogStatus("Unable to queue diagnostics: " + reason)
+        End If
 
     End Sub
 
@@ -684,9 +677,14 @@ Public Class Form1
         ReaderConnected = False
         CommandInProgress = False
         LonResyncAttempt = 0
+        PendingReadData = String.Empty
+        WorkerRequestAt = DateTime.MinValue
+        WorkerStallReported = False
 
         InvalidateReaderGeneration()
-        SafeDisconnectAndDisposeReader()
+
+        ' Queue disconnect behind any in-flight command, without blocking UI.
+        If m_worker IsNot Nothing Then m_worker.TryDisconnect(ReaderGeneration)
 
         Dim delayMs As Integer = ReconnectDelayMs
         If RecoveryAttempt > 5 Then delayMs = LongReconnectDelayMs
@@ -694,11 +692,9 @@ Public Class Form1
         NextActionAt = DateTime.Now.AddMilliseconds(delayMs)
         TgrBtn.Enabled = False
 
-        LogStatus(
-            "Recovery scheduled in " + delayMs.ToString() +
-            " ms. Reason: " + reason +
-            ". Attempt: " + RecoveryAttempt.ToString()
-        )
+        LogStatus("Recovery scheduled in " + delayMs.ToString() +
+                  " ms. Reason: " + reason +
+                  ". Attempt: " + RecoveryAttempt.ToString())
 
     End Sub
 
@@ -713,46 +709,19 @@ Public Class Form1
         End If
 
         CurrentState = CameraState.Connecting
+        CommandInProgress = False
+        ReaderConnected = False
+        WorkerRequestAt = DateTime.Now
+        WorkerStallReported = False
+        InvalidateReaderGeneration()
 
-        Try
-            m_reader = New ReaderAccessor()
-            m_reader.IpAddress = readerIp
+        If m_worker Is Nothing OrElse
+           Not m_worker.TryConnect(readerIp, ReaderGeneration) Then
+            StartRecovery("Reconnect could not be queued")
+            Return
+        End If
 
-            ReaderGeneration += 1
-            Dim thisGeneration As Integer = ReaderGeneration
-
-            m_reader.Connect(
-                Sub(data As Byte()) ReceivedDataAction(data, thisGeneration)
-            )
-
-            ReaderConnected = True
-            TgrBtn.Enabled = True
-            LonResyncAttempt = 0
-
-            CurrentState = CameraState.SynchronizingOff
-            NextActionAt = DateTime.Now.AddMilliseconds(InitialCommandDelayMs)
-
-            LogStatus("Reader reconnected. Trigger synchronization scheduled.")
-
-        Catch ex As Exception
-            RecoveryAttempt += 1
-            ReaderConnected = False
-
-            InvalidateReaderGeneration()
-            SafeDisconnectAndDisposeReader()
-
-            CurrentState = CameraState.Recovering
-
-            Dim delayMs As Integer = ReconnectDelayMs
-            If RecoveryAttempt > 5 Then delayMs = LongReconnectDelayMs
-
-            NextActionAt = DateTime.Now.AddMilliseconds(delayMs)
-
-            LogStatus(
-                "Reconnect failed: " + ex.Message +
-                ". Next attempt in " + delayMs.ToString() + " ms."
-            )
-        End Try
+        LogStatus("Reconnection queued on Keyence worker.")
 
     End Sub
 
@@ -760,23 +729,7 @@ Public Class Form1
         ReaderGeneration += 1
     End Sub
 
-    Private Sub SafeDisconnectAndDisposeReader()
 
-        If m_reader Is Nothing Then Return
-
-        Try
-            m_reader.Disconnect()
-        Catch
-            ' Ignore disconnect errors during recovery.
-        End Try
-
-        Try
-            m_reader.Dispose()
-        Catch
-            ' Ignore dispose errors during recovery.
-        End Try
-
-    End Sub
 
     Private Function NormalizeReaderData(value As String) As String
 
@@ -827,24 +780,10 @@ Public Class Form1
         ClosingApplication = True
         CurrentState = CameraState.Closing
         Timer1.Stop()
-
-        Try
-            If ReaderConnected AndAlso Not CommandInProgress Then
-                CommandInProgress = True
-
-                Try
-                    ' Best effort only. Closing must never wait on state logic.
-                    m_reader.ExecCommand("LOFF")
-                Catch
-                Finally
-                    CommandInProgress = False
-                End Try
-            End If
-        Catch
-        End Try
-
         InvalidateReaderGeneration()
-        SafeDisconnectAndDisposeReader()
+
+        ' Never block the Windows Forms UI on the SDK while closing.
+        If m_worker IsNot Nothing Then m_worker.Shutdown()
 
         Try
             m_searcher.Stop()
