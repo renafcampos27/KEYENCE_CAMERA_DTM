@@ -44,6 +44,7 @@ Friend NotInheritable Class KeyenceWorker
     Friend Event OperationCompleted(result As OperationResult)
     Friend Event TextReceived(generation As Integer, value As String)
     Friend Event DiagnosticCompleted(generation As Integer, lines As String())
+    Friend Event WorkerFault(message As String)
 
     Public Sub New(postToUi As Action(Of Action))
         If postToUi Is Nothing Then Throw New ArgumentNullException("postToUi")
@@ -195,9 +196,9 @@ Friend NotInheritable Class KeyenceWorker
                 Dim completed As OperationResult = result
                 PostToUi(Sub() EmitOperationCompleted(completed))
             Next
-        Catch
-            ' The worker cannot safely restart a blocked/malfunctioning SDK
-            ' inside the same process. Main application remains responsive.
+        Catch ex As Exception
+            Dim failureMessage As String = ex.ToString()
+            PostToUi(Sub() EmitWorkerFault(failureMessage))
         Finally
             CloseReader()
 
@@ -266,6 +267,10 @@ Friend NotInheritable Class KeyenceWorker
 
     Private Sub EmitDiagnosticCompleted(generation As Integer, lines As String())
         RaiseEvent DiagnosticCompleted(generation, lines)
+    End Sub
+
+    Private Sub EmitWorkerFault(message As String)
+        RaiseEvent WorkerFault(message)
     End Sub
 
     Private Sub PostToUi(action As Action)
