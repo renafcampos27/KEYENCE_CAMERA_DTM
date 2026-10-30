@@ -53,6 +53,8 @@ Friend NotInheritable Class KeyenceWorker
         _thread = New Thread(AddressOf WorkerLoop)
         _thread.Name = "Keyence-ReaderAccessor-Worker"
         _thread.IsBackground = True
+        ' Match the original WinForms STA thread's apartment model for SDK calls.
+        _thread.SetApartmentState(ApartmentState.STA)
         _thread.Start()
     End Sub
 
