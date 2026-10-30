@@ -614,7 +614,10 @@ Public Class Form1
         ' Do not use StartsWith("OK") or StartsWith("ER") here.
         Return normalized.StartsWith("OK,BUSYSTAT,", StringComparison.Ordinal) OrElse
                normalized.StartsWith("OK,ERRSTAT,", StringComparison.Ordinal) OrElse
-               normalized.StartsWith("OK,RLOCK,", StringComparison.Ordinal)
+               normalized.StartsWith("OK,RLOCK,", StringComparison.Ordinal) OrElse
+               normalized.StartsWith("ER,BUSYSTAT,", StringComparison.Ordinal) OrElse
+               normalized.StartsWith("ER,ERRSTAT,", StringComparison.Ordinal) OrElse
+               normalized.StartsWith("ER,RLOCK,", StringComparison.Ordinal)
 
     End Function
 
