@@ -563,8 +563,8 @@ Public Class Form1
         Return normalized = "4F4B" OrElse
                normalized = "4552" OrElse
                normalized = "NG" OrElse
-               normalized.StartsWith("OK") OrElse
-               normalized.StartsWith("ER")
+               normalized = "OK" OrElse
+               normalized = "ER"
 
     End Function
 
