@@ -133,7 +133,7 @@ Friend NotInheritable Class KeyenceWorker
                 If item.Kind = OperationKind.ReaderData Then
                     Dim capturedItem As WorkItem = item
                     PostToUi(Sub()
-                                 RaiseEvent TextReceived(
+                                 EmitTextReceived(
                                      capturedItem.Generation,
                                      capturedItem.ReaderText
                                  )
@@ -193,7 +193,7 @@ Friend NotInheritable Class KeyenceWorker
                 End Try
 
                 Dim completed As OperationResult = result
-                PostToUi(Sub() RaiseEvent OperationCompleted(completed))
+                PostToUi(Sub() EmitOperationCompleted(completed))
             Next
         Catch
             ' The worker cannot safely restart a blocked/malfunctioning SDK
@@ -237,7 +237,7 @@ Friend NotInheritable Class KeyenceWorker
 
         Dim capturedGeneration As Integer = item.Generation
         Dim messages() As String = output.ToArray()
-        PostToUi(Sub() RaiseEvent DiagnosticCompleted(capturedGeneration, messages))
+        PostToUi(Sub() EmitDiagnosticCompleted(capturedGeneration, messages))
     End Sub
 
     Private Sub CloseReader()
@@ -254,6 +254,18 @@ Friend NotInheritable Class KeyenceWorker
             oldReader.Dispose()
         Catch
         End Try
+    End Sub
+
+    Private Sub EmitOperationCompleted(result As OperationResult)
+        RaiseEvent OperationCompleted(result)
+    End Sub
+
+    Private Sub EmitTextReceived(generation As Integer, value As String)
+        RaiseEvent TextReceived(generation, value)
+    End Sub
+
+    Private Sub EmitDiagnosticCompleted(generation As Integer, lines As String())
+        RaiseEvent DiagnosticCompleted(generation, lines)
     End Sub
 
     Private Sub PostToUi(action As Action)
