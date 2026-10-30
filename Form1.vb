@@ -411,7 +411,7 @@ Public Class Form1
 
         If result.Failure Is Nothing Then
             outcome = ClassifyCommandResponse(NormalizeReaderData(result.Response))
-            LogStatus(result.Purpose + " " + result.Purpose + " " +
+            LogStatus(result.Purpose + " " +
                       If(result.Purpose = "StartRead", "LON", "LOFF") +
                       " -> " + outcome.ToString() +
                       FormatCommandResponse(NormalizeReaderData(result.Response)))
