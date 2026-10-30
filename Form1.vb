@@ -283,7 +283,7 @@ Public Class Form1
 
 
 
-    Private Sub ReceivedDataWrite(receivedData As String, generation As Integer)
+    Private Sub ReceivedDataWrite(generation As Integer, receivedData As String)
 
         If ClosingApplication Then Return
         If generation <> ReaderGeneration Then
