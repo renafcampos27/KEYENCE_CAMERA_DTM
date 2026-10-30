@@ -19,6 +19,7 @@ Public Class Form1
         Success
         ExplicitFailure
         NoResponse
+        UnexpectedResponse
         ExceptionThrown
     End Enum
 
@@ -322,8 +323,8 @@ Public Class Form1
 
         ' Command responses belong to ExecCommand. If the SDK also forwards
         ' them through the data callback, they must never be handled as labels.
-        If IsCommandResponse(upperData) Then
-            LogStatus("Command response on data channel: " + cleanData)
+        If IsCommandResponse(upperData) OrElse IsDiagnosticResponse(upperData) Then
+            LogStatus("Command/diagnostic response on data channel: " + cleanData)
             Return
         End If
 
@@ -361,12 +362,19 @@ Public Class Form1
             LogStatus("Web transfer error: " + ex.Message)
         End Try
 
-        If loffOutcome = CommandOutcome.ExceptionThrown Then
-            StartRecovery("LOFF communication exception after reader response")
+        If loffOutcome = CommandOutcome.ExceptionThrown OrElse
+           loffOutcome = CommandOutcome.UnexpectedResponse Then
+
+            StartRecovery("LOFF exception or unexpected response after reading")
         Else
-            ' Success, ER, empty or unknown response all mean that the command
-            ' transaction completed. ER is allowed here because the reader can
-            ' already be in standby after finishing the read.
+            ' LOFF can return ER if the reader has already finished the read.
+            ' A missing response is not confirmation of the physical OFF state.
+            If loffOutcome = CommandOutcome.ExplicitFailure OrElse
+               loffOutcome = CommandOutcome.NoResponse Then
+
+                LogStatus("LOFF OFF state not independently confirmed; continuing normal cycle.")
+            End If
+
             ScheduleTriggerOnAfterOffDelay()
         End If
 
@@ -410,11 +418,19 @@ Public Class Form1
                     Dim loffOutcome As CommandOutcome =
                         ExecuteTriggerCommand("LOFF", "Synchronize trigger OFF")
 
-                    If loffOutcome = CommandOutcome.ExceptionThrown Then
-                        StartRecovery("LOFF communication exception during synchronization")
+                    If loffOutcome = CommandOutcome.ExceptionThrown OrElse
+                       loffOutcome = CommandOutcome.UnexpectedResponse Then
+
+                        StartRecovery("LOFF exception or unexpected response during synchronization")
                     Else
-                        ' Do NOT block here on ER or an empty response.
-                        ' ER can mean that LOFF was sent while already OFF.
+                        ' ER can mean the reader was already OFF. Do not retry
+                        ' LOFF indefinitely on ER or an absent response.
+                        If loffOutcome = CommandOutcome.ExplicitFailure OrElse
+                           loffOutcome = CommandOutcome.NoResponse Then
+
+                            LogStatus("LOFF OFF state not independently confirmed.")
+                        End If
+
                         ScheduleTriggerOnAfterOffDelay()
                     End If
 
@@ -425,19 +441,30 @@ Public Class Form1
                         ExecuteTriggerCommand("LON", "Start read cycle")
 
                     Select Case lonOutcome
-                        Case CommandOutcome.Success,
-                             CommandOutcome.NoResponse
-
+                        Case CommandOutcome.Success
                             CurrentState = CameraState.WaitingForRead
                             NextActionAt = DateTime.MinValue
                             RecoveryAttempt = 0
                             LonResyncAttempt = 0
 
-                            LogStatus(
-                                "LON command completed. Waiting for a label."
-                            )
+                            LogStatus("LON accepted by reader; waiting for a label.")
 
-                        Case CommandOutcome.ExplicitFailure
+                        Case CommandOutcome.NoResponse
+                            ' A trigger response may be disabled in the reader.
+                            ' Query state for diagnosis but NEVER send blind LON
+                            ' retries just because no label has arrived.
+                            LogReaderDiagnostics("LON without response")
+                            CurrentState = CameraState.WaitingForRead
+                            NextActionAt = DateTime.MinValue
+                            RecoveryAttempt = 0
+                            LonResyncAttempt = 0
+
+                            LogStatus("LON sent without acknowledgement; trigger state UNCONFIRMED.")
+
+                        Case CommandOutcome.ExplicitFailure,
+                             CommandOutcome.UnexpectedResponse
+
+                            LogReaderDiagnostics("LON rejected or unexpected response")
                             LonResyncAttempt += 1
 
                             If LonResyncAttempt <= MaxLonResyncAttempts Then
@@ -445,11 +472,11 @@ Public Class Form1
                                 NextActionAt = DateTime.Now.AddMilliseconds(250)
 
                                 LogStatus(
-                                    "LON returned ER/NG. Resynchronizing OFF before retry " +
+                                    "LON not confirmed; resynchronizing OFF before retry " +
                                     LonResyncAttempt.ToString() + "."
                                 )
                             Else
-                                StartRecovery("LON rejected after resynchronization")
+                                StartRecovery("LON not confirmed after resynchronization")
                             End If
 
                         Case CommandOutcome.ExceptionThrown
@@ -549,20 +576,17 @@ Public Class Form1
 
         Dim normalized As String = response.Trim().ToUpperInvariant()
 
-        If normalized = "4F4B" OrElse
-           normalized.StartsWith("OK") Then
+        If normalized = "4F4B" OrElse normalized = "OK" Then
             Return CommandOutcome.Success
         End If
 
         If normalized = "4552" OrElse
-           normalized = "NG" OrElse
-           normalized.StartsWith("ER") Then
+           normalized = "NG" OrElse normalized = "ER" Then
             Return CommandOutcome.ExplicitFailure
         End If
 
-        ' Unknown text is treated as no explicit failure. The command was sent
-        ' and the SDK returned normally, so do not create a reconnect storm.
-        Return CommandOutcome.NoResponse
+        ' Unexpected text is NOT a successful acknowledgement.
+        Return CommandOutcome.UnexpectedResponse
 
     End Function
 
@@ -579,6 +603,64 @@ Public Class Form1
                normalized = "ER"
 
     End Function
+
+    Private Function IsDiagnosticResponse(value As String) As Boolean
+
+        If String.IsNullOrWhiteSpace(value) Then Return False
+
+        Dim normalized As String = value.Trim().ToUpperInvariant()
+
+        ' These are structured diagnostic replies, not DTM read results.
+        ' Do not use StartsWith("OK") or StartsWith("ER") here.
+        Return normalized.StartsWith("OK,BUSYSTAT,", StringComparison.Ordinal) OrElse
+               normalized.StartsWith("OK,ERRSTAT,", StringComparison.Ordinal) OrElse
+               normalized.StartsWith("OK,RLOCK,", StringComparison.Ordinal)
+
+    End Function
+
+    Private Sub LogReaderDiagnostics(reason As String)
+
+        ' Read-only commands. Never unlock, reset, change banks or update
+        ' trigger state based on BUSYSTAT=none: it may be normal in standby.
+        If ClosingApplication OrElse Not ReaderConnected OrElse
+           m_reader Is Nothing OrElse CommandInProgress Then Return
+
+        CommandInProgress = True
+
+        Try
+            Dim commands() As String = {"BUSYSTAT", "ERRSTAT", "RLOCK"}
+
+            For Each diagnosticCommand As String In commands
+                Try
+                    Dim result As String =
+                        NormalizeReaderData(m_reader.ExecCommand(diagnosticCommand))
+
+                    If String.IsNullOrWhiteSpace(result) Then
+                        LogStatus("DIAG " + diagnosticCommand +
+                                  " -> no response | " + reason)
+                    Else
+                        LogStatus("DIAG " + diagnosticCommand +
+                                  " -> " + result + " | " + reason)
+
+                        If diagnosticCommand = "RLOCK" AndAlso
+                           result.Equals("OK,RLOCK,LOCK",
+                                         StringComparison.OrdinalIgnoreCase) Then
+
+                            LogStatus("DIAG WARNING: Keyence reports TRIGGER LOCK. " +
+                                      "No automatic UNLOCK was sent.")
+                        End If
+                    End If
+                Catch ex As Exception
+                    ' Diagnostic failure must not interrupt normal reading.
+                    LogStatus("DIAG " + diagnosticCommand +
+                              " failed: " + ex.Message)
+                End Try
+            Next
+        Finally
+            CommandInProgress = False
+        End Try
+
+    End Sub
 
     Private Function FormatCommandResponse(response As String) As String
 
